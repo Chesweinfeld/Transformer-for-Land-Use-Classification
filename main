@@ -53,6 +53,36 @@ def cross_entropy_scratch(logits: torch.Tensor, targets: torch.Tensor) -> torch.
     return losses.mean()
 
 
+def softmax_scratch(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    max_vals = x.max(dim=dim, keepdim=True).values
+    stabilized = x - max_vals
+    exp_x = torch.exp(stabilized)
+    return exp_x / exp_x.sum(dim=dim, keepdim=True)
+
+
+def image_to_patches_scratch(
+    x: torch.Tensor,
+    patch_size: int,
+    expected_channels: int,
+) -> torch.Tensor:
+    if x.dim() != 4:
+        raise ValueError(f"expected input of shape [batch, channels, height, width], got {tuple(x.shape)}")
+
+    bsz, chans, height, width = x.shape
+    if chans != expected_channels:
+        raise ValueError(f"expected {expected_channels} input channels, got {chans}")
+    if height % patch_size != 0 or width % patch_size != 0:
+        raise ValueError(
+            f"image size ({height}, {width}) must be divisible by patch_size={patch_size}"
+        )
+
+    h_patches = height // patch_size
+    w_patches = width // patch_size
+    patches = x.reshape(bsz, chans, h_patches, patch_size, w_patches, patch_size)
+    patches = patches.permute(0, 2, 4, 1, 3, 5).contiguous()
+    return patches.view(bsz, h_patches * w_patches, chans * patch_size * patch_size)
+
+
 class LinearScratch(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         super().__init__()
@@ -100,13 +130,11 @@ class PatchEmbedScratch(nn.Module):
         self.proj = LinearScratch(self.patch_dim, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, chans, height, width = x.shape
-        p = self.patch_size
-        h_patches = height // p
-        w_patches = width // p
-        patches = x.reshape(bsz, chans, h_patches, p, w_patches, p)
-        patches = patches.permute(0, 2, 4, 1, 3, 5).contiguous()
-        patches = patches.view(bsz, h_patches * w_patches, self.patch_dim)
+        patches = image_to_patches_scratch(
+            x,
+            patch_size=self.patch_size,
+            expected_channels=self.in_chans,
+        )
         return self.proj(patches)
 
 
@@ -132,7 +160,7 @@ class MultiHeadSelfAttentionScratch(nn.Module):
         v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
-        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = softmax_scratch(attn_scores, dim=-1)
         attn_weights = dropout_scratch(attn_weights, p=self.dropout, training=self.training)
 
         attn_out = attn_weights @ v
