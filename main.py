@@ -389,10 +389,63 @@ class SwinBlock(nn.Module):
         )
         self.norm2 = LayerNormScratch(dim)
         self.mlp = MLP(dim, mlp_ratio=mlp_ratio, dropout=dropout)
+        heigh, width = input_resolution
+        mask = self.compute_attn_mask(heigh, width, torch.device("cpu"))
+        if mask is not None:
+            self.register_buffer("attn_mask", mask)
+        else: 
+            self.attn_mask = None
 
-    def compute_attn_mask(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+    def compute_attn_mask(self, height, width, device):
+
         if self.shift_size == 0:
             return None
+
+        ws = self.window_size
+        ss = self.shift_size
+        num_windows_h = height // ws
+        num_windows_w = width // ws
+
+        masks = []
+
+        # loop over windows
+        for win_h in range(num_windows_h):
+            for win_w in range(num_windows_w):
+
+                token_window_ids = []
+                # loop over tokens
+                for i in range(ws):
+                    for j in range(ws):
+
+                        shifted_r = win_h * ws + i
+                        shifted_c = win_w * ws + j
+
+                        orig_r = (shifted_r + ss) % height
+                        orig_c = (shifted_c + ss) % width
+
+                        orig_win_h = orig_r // ws
+                        orig_win_w = orig_c // ws
+
+                        window_id = orig_win_h * num_windows_w + orig_win_w
+
+                        token_window_ids.append(window_id)
+
+                token_window_ids = torch.tensor(token_window_ids,device=device)
+
+                # Compare every pair
+                mask = (
+                    token_window_ids[:, None]
+                    !=
+                    token_window_ids[None, :]
+                )
+
+                mask = mask.float() * -100.0
+
+                masks.append(mask)
+
+        masks = torch.stack(masks)
+
+        return masks
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         height, width = self.input_resolution
@@ -412,6 +465,10 @@ class SwinBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, chans)
 
         attn_mask = self.compute_attn_mask(height, width, x.device)
+        attn_mask = self.attn_mask
+
+        if attn_mask is not None: 
+            attn_mask = attn_mask.to(x.device)
         attn_windows = self.attn(x_windows, attn_mask=attn_mask)
 
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, chans)
