@@ -257,13 +257,13 @@ class VisionTransformer(nn.Module):
         self.pos_type = pos_type
         if self.pos_type == 'learned':
             self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        elif self.pos_type == '2d': 
+        elif self.pos_type == '2d':
             pos = sincos2d(num_patches, embed_dim)
             pos = torch.cat([torch.zeros(1, embed_dim), pos], dim=0)
             self.register_buffer("pos_embed", pos.unsqueeze(0))
-        elif self.pos_type == 'none': 
+        elif self.pos_type == 'none':
             self.register_buffer("pos_embed",torch.zeros(1, num_patches + 1, embed_dim))
-            
+
         self.pos_drop_p = dropout
 
         self.blocks = nn.Sequential(*[
@@ -295,6 +295,287 @@ class VisionTransformer(nn.Module):
         return self.head(res)
 
 
+# -----------------------------
+# Swin Transformer
+# -----------------------------
+
+def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
+    bsz, height, width, chans = x.shape
+    if height % window_size != 0 or width % window_size != 0:
+        raise ValueError(
+            f"feature map size ({height}, {width}) must be divisible by window_size={window_size}"
+        )
+    h_windows = height // window_size
+    w_windows = width // window_size
+    x = x.view(bsz, h_windows, window_size, w_windows, window_size, chans)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return x.view(bsz * h_windows * w_windows, window_size, window_size, chans)
+
+
+def window_reverse(windows: torch.Tensor, window_size: int, height: int, width: int) -> torch.Tensor:
+    h_windows = height // window_size
+    w_windows = width // window_size
+    bsz = windows.shape[0] // (h_windows * w_windows)
+    x = windows.view(bsz, h_windows, w_windows, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+    return x.view(bsz, height, width, -1)
+
+
+class WindowAttention(nn.Module):
+    def __init__(self, dim: int, window_size: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = LinearScratch(dim, dim)
+        self.k_proj = LinearScratch(dim, dim)
+        self.v_proj = LinearScratch(dim, dim)
+        self.out_proj = LinearScratch(dim, dim)
+        self.dropout = dropout
+
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+        bsz, seq_len, _ = x.shape
+
+        q = self.q_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+
+        if attn_mask is not None:
+            num_windows = attn_mask.shape[0]
+            attn_scores = attn_scores.view(
+                bsz // num_windows, num_windows, self.num_heads, seq_len, seq_len
+            )
+            attn_scores = attn_scores + attn_mask.view(1, num_windows, 1, seq_len, seq_len)
+            attn_scores = attn_scores.view(bsz, self.num_heads, seq_len, seq_len)
+
+        attn_weights = softmax_scratch(attn_scores, dim=-1)
+        attn_weights = dropout_scratch(attn_weights, p=self.dropout, training=self.training)
+
+        attn_out = attn_weights @ v
+        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, self.dim)
+        attn_out = self.out_proj(attn_out)
+        attn_out = dropout_scratch(attn_out, p=self.dropout, training=self.training)
+        return attn_out
+
+
+class SwinBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        input_resolution: Tuple[int, int],
+        num_heads: int,
+        window_size: int = 4,
+        shift_size: int = 0,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert 0 <= shift_size < window_size, "shift_size must be in [0, window_size)"
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        self.norm1 = LayerNormScratch(dim)
+        self.attn = WindowAttention(
+            dim=dim, window_size=window_size, num_heads=num_heads, dropout=dropout
+        )
+        self.norm2 = LayerNormScratch(dim)
+        self.mlp = MLP(dim, mlp_ratio=mlp_ratio, dropout=dropout)
+
+    def compute_attn_mask(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        if self.shift_size == 0:
+            return None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        height, width = self.input_resolution
+        bsz, seq_len, chans = x.shape
+        assert seq_len == height * width, "input feature has wrong size"
+
+        residual = x
+        x = self.norm1(x)
+        x = x.view(bsz, height, width, chans)
+
+        if self.shift_size > 0:
+            shifted = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted = x
+
+        x_windows = window_partition(shifted, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, chans)
+
+        attn_mask = self.compute_attn_mask(height, width, x.device)
+        attn_windows = self.attn(x_windows, attn_mask=attn_mask)
+
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, chans)
+        shifted = window_reverse(attn_windows, self.window_size, height, width)
+
+        if self.shift_size > 0:
+            x = torch.roll(shifted, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted
+
+        x = x.view(bsz, height * width, chans)
+        x = residual + x
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class PatchMerging(nn.Module):
+    def __init__(self, input_resolution: Tuple[int, int], dim: int):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.norm = LayerNormScratch(4 * dim)
+        self.reduction = LinearScratch(4 * dim, 2 * dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        height, width = self.input_resolution
+        bsz, seq_len, chans = x.shape
+        assert seq_len == height * width, "input feature has wrong size"
+        assert height % 2 == 0 and width % 2 == 0, "H and W must be even for patch merging"
+
+        x = x.view(bsz, height, width, chans)
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], dim=-1)
+        x = x.view(bsz, (height // 2) * (width // 2), 4 * chans)
+
+        x = self.norm(x)
+        x = self.reduction(x)
+        return x
+
+
+class SwinPatchEmbed(nn.Module):
+    def __init__(self, img_size: int = 64, patch_size: int = 4, in_chans: int = 3, embed_dim: int = 96):
+        super().__init__()
+        self.embed = PatchEmbedScratch(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+        )
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = self.embed.num_patches
+        self.patches_resolution = (img_size // patch_size, img_size // patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.embed(x)
+
+
+class BasicLayer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        input_resolution: Tuple[int, int],
+        depth: int,
+        num_heads: int,
+        window_size: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        downsample: bool = False,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.depth = depth
+
+        self.blocks = nn.ModuleList([
+            SwinBlock(
+                dim=dim,
+                input_resolution=input_resolution,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+            )
+            for i in range(depth)
+        ])
+
+        if downsample:
+            self.downsample = PatchMerging(input_resolution=input_resolution, dim=dim)
+        else:
+            self.downsample = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return x
+
+
+class SwinTransformer(nn.Module):
+    def __init__(
+        self,
+        img_size: int = 64,
+        patch_size: int = 4,
+        in_chans: int = 3,
+        num_classes: int = 10,
+        embed_dim: int = 96,
+        depths: Tuple[int, ...] = (2, 2, 6),
+        num_heads: Tuple[int, ...] = (3, 6, 12),
+        window_size: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert len(depths) == len(num_heads), "depths and num_heads must have the same length"
+        self.num_stages = len(depths)
+        self.embed_dim = embed_dim
+        self.num_features = int(embed_dim * 2 ** (self.num_stages - 1))
+
+        self.patch_embed = SwinPatchEmbed(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+        )
+        self.pos_drop_p = dropout
+
+        self.layers = nn.ModuleList()
+        cur_resolution = self.patch_embed.patches_resolution
+        for i_stage in range(self.num_stages):
+            stage_dim = int(embed_dim * 2 ** i_stage)
+            is_last = i_stage == self.num_stages - 1
+            layer = BasicLayer(
+                dim=stage_dim,
+                input_resolution=cur_resolution,
+                depth=depths[i_stage],
+                num_heads=num_heads[i_stage],
+                window_size=window_size,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                downsample=not is_last,
+            )
+            self.layers.append(layer)
+            if not is_last:
+                cur_resolution = (cur_resolution[0] // 2, cur_resolution[1] // 2)
+
+        self.norm = LayerNormScratch(self.num_features)
+        self.head = LinearScratch(self.num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(x)
+        x = dropout_scratch(x, p=self.pos_drop_p, training=self.training)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        x = x.mean(dim=1)
+        return self.head(x)
+
+
 @dataclass
 class TrainConfig:
     data_dir: str
@@ -315,6 +596,11 @@ class TrainConfig:
     dropout: float = 0.1
     in_chans: int = 3
     pos_type: str = 'learned'
+    model: str = 'vit'
+    window_size: int = 4
+    swin_embed_dim: int = 96
+    swin_depths: Tuple[int, ...] = (2, 2, 6)
+    swin_num_heads: Tuple[int, ...] = (3, 6, 12)
 
 
 def build_dataloaders(cfg: TrainConfig):
@@ -442,18 +728,34 @@ def main(cfg: TrainConfig) -> None:
     train_loader, val_loader, test_loader, classes = build_dataloaders(cfg)
     print(f"Classes ({len(classes)}): {classes}")
 
-    model = VisionTransformer(
-        img_size=cfg.img_size,
-        patch_size=cfg.patch_size,
-        in_chans=cfg.in_chans,
-        num_classes=len(classes),
-        embed_dim=cfg.embed_dim,
-        depth=cfg.depth,
-        num_heads=cfg.num_heads,
-        mlp_ratio=cfg.mlp_ratio,
-        dropout=cfg.dropout,
-        pos_type = cfg.pos_type
-    ).to(device)
+    if cfg.model == "vit":
+        model = VisionTransformer(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_size,
+            in_chans=cfg.in_chans,
+            num_classes=len(classes),
+            embed_dim=cfg.embed_dim,
+            depth=cfg.depth,
+            num_heads=cfg.num_heads,
+            mlp_ratio=cfg.mlp_ratio,
+            dropout=cfg.dropout,
+            pos_type = cfg.pos_type
+        ).to(device)
+    elif cfg.model == "swin":
+        model = SwinTransformer(
+            img_size=cfg.img_size,
+            patch_size=cfg.patch_size,
+            in_chans=cfg.in_chans,
+            num_classes=len(classes),
+            embed_dim=cfg.swin_embed_dim,
+            depths=tuple(cfg.swin_depths),
+            num_heads=tuple(cfg.swin_num_heads),
+            window_size=cfg.window_size,
+            mlp_ratio=cfg.mlp_ratio,
+            dropout=cfg.dropout,
+        ).to(device)
+    else:
+        raise ValueError(f"unknown model: {cfg.model}")
 
     #Resnet
     # model = models.resnet50(weights=None)
@@ -465,7 +767,7 @@ def main(cfg: TrainConfig) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
 
     best_val_acc = -math.inf
-    best_path = Path("best_eurosat_vit_scratch_mps_fast.pt")
+    best_path = Path(f"best_eurosat_{cfg.model}_scratch_mps_fast.pt")
 
     for epoch in range(1, cfg.epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
@@ -517,6 +819,11 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--in_chans", type=int, default=3)
     parser.add_argument("--pos_type", type=str, default='learned')
+    parser.add_argument("--model", type=str, default='vit', choices=['vit', 'swin'])
+    parser.add_argument("--window_size", type=int, default=4)
+    parser.add_argument("--swin_embed_dim", type=int, default=96)
+    parser.add_argument("--swin_depths", type=int, nargs="+", default=[2, 2, 6])
+    parser.add_argument("--swin_num_heads", type=int, nargs="+", default=[3, 6, 12])
     args = parser.parse_args()
 
     cfg = TrainConfig(**vars(args))
