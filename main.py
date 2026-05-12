@@ -135,6 +135,52 @@ class PatchEmbedScratch(nn.Module):
         return self.proj(patches)
 
 
+#Relative position bias (Swin-style, adapted for full self-attention + CLS)
+
+def build_relative_position_index(
+    grid_size: Tuple[int, int],
+    use_cls_token: bool,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Build an integer index tensor of shape [N, N] (or [N+1, N+1] with CLS)
+    that selects the right row of the relative position bias table for every
+    (query, key) pair.
+    Returns (relative_position_index, num_entries) where num_entries is the
+    size of the bias table along its first dim.
+    """
+    H, W = grid_size
+    num_patch_offsets = (2 * H - 1) * (2 * W - 1)
+
+    # Pairwise patch->patch relative coordinates 
+    coords_h = torch.arange(H)
+    coords_w = torch.arange(W)
+    coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=0)  # 2, H, W
+    coords_flat = coords.flatten(1)  # 2, N
+    relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]  # 2, N, N
+    relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # N, N, 2
+    # Shift to non-negative range
+    relative_coords[:, :, 0] += H - 1          # row offset in [0, 2H-2]
+    relative_coords[:, :, 1] += W - 1          # col offset in [0, 2W-2]
+    relative_coords[:, :, 0] *= 2 * W - 1      # flatten 2D offset to 1D
+    relative_position_index = relative_coords.sum(-1)  # N, N
+
+    if not use_cls_token:
+        return relative_position_index.long(), num_patch_offsets
+
+    # Extend index for a single CLS token sitting at position 0.
+    # Reserve three additional table rows for the special CLS interactions:
+    #   cls -> cls, cls -> patch, patch -> cls
+    N = H * W
+    full_index = torch.zeros((N + 1, N + 1), dtype=torch.long)
+    full_index[1:, 1:] = relative_position_index
+    full_index[0, 0] = num_patch_offsets          # cls -> cls
+    full_index[0, 1:] = num_patch_offsets + 1     # cls -> patch
+    full_index[1:, 0] = num_patch_offsets + 2     # patch -> cls
+
+    num_entries = num_patch_offsets + 3
+    return full_index, num_entries
+
+
 class MultiHeadSelfAttentionScratch(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
