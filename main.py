@@ -4,7 +4,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
-
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -382,6 +382,14 @@ class WindowAttention(nn.Module):
         self.out_proj = LinearScratch(dim, dim)
         self.dropout = dropout
 
+        relative_position_index, num_relative_positions = (build_relative_position_index((window_size, window_size),use_cls_token=False))
+
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.relative_position_bias_table = nn.Parameter(torch.zeros(num_relative_positions, num_heads))
+
+        nn.init.trunc_normal_(self.relative_position_bias_table,std=0.02)
+
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -391,7 +399,13 @@ class WindowAttention(nn.Module):
         v = self.v_proj(x).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.reshape(-1)]
+        M = self.window_size * self.window_size
+        relative_position_bias = relative_position_bias.reshape(M,M,self.num_heads)
 
+        relative_position_bias = relative_position_bias.permute(2, 0, 1)
+
+        attn_scores = attn_scores + relative_position_bias.unsqueeze(0)
         if attn_mask is not None:
             num_windows = attn_mask.shape[0]
             attn_scores = attn_scores.view(
@@ -505,7 +519,7 @@ class SwinBlock(nn.Module):
         if self.shift_size > 0:
             shifted = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
-            shifted = x
+            shifted = x 
 
         x_windows = window_partition(shifted, self.window_size)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, chans)
@@ -587,19 +601,23 @@ class BasicLayer(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         downsample: bool = False,
+        disable_shift: bool = False
     ):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
         self.depth = depth
+        
 
-        self.blocks = nn.ModuleList([
+        self.blocks = nn.ModuleList(
+            [
             SwinBlock(
                 dim=dim,
                 input_resolution=input_resolution,
                 num_heads=num_heads,
                 window_size=window_size,
-                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                shift_size=0 if disable_shift else (0 if (i % 2 == 0) else window_size // 2),
+                #shift_size=random.randint(0, window_size - 1),
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
             )
@@ -632,6 +650,7 @@ class SwinTransformer(nn.Module):
         window_size: int = 4,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        disable_shift: bool = False
     ):
         super().__init__()
         assert len(depths) == len(num_heads), "depths and num_heads must have the same length"
@@ -661,6 +680,7 @@ class SwinTransformer(nn.Module):
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 downsample=not is_last,
+                disable_shift = disable_shift
             )
             self.layers.append(layer)
             if not is_last:
@@ -691,7 +711,7 @@ class TrainConfig:
     test_split: float = 0.1
     num_workers: int = 8
     seed: int = 42
-    patch_size: int = 8
+    patch_size: int = 4
     embed_dim: int = 192
     depth: int = 4
     num_heads: int = 6
@@ -704,6 +724,7 @@ class TrainConfig:
     swin_embed_dim: int = 96
     swin_depths: Tuple[int, ...] = (2, 2, 6)
     swin_num_heads: Tuple[int, ...] = (3, 6, 12)
+    disable_shift: bool = False
 
 
 def build_dataloaders(cfg: TrainConfig):
@@ -856,6 +877,7 @@ def main(cfg: TrainConfig) -> None:
             window_size=cfg.window_size,
             mlp_ratio=cfg.mlp_ratio,
             dropout=cfg.dropout,
+            disable_shift = cfg.disable_shift
         ).to(device)
     else:
         raise ValueError(f"unknown model: {cfg.model}")
@@ -871,7 +893,10 @@ def main(cfg: TrainConfig) -> None:
 
     best_val_acc = -math.inf
     best_path = Path(f"best_eurosat_{cfg.model}_scratch_mps_fast.pt")
+    num_params = sum(p.numel() for p in model.parameters())
 
+    print(f"Total params: {num_params:,}")
+    start = time.time()
     for epoch in range(1, cfg.epochs + 1):
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
@@ -897,9 +922,14 @@ def main(cfg: TrainConfig) -> None:
     checkpoint = torch.load(best_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+    total_time = time.time() - start
+    hours = int(total_time // 3600)
+    minutes = int((total_time % 3600) // 60)
+    seconds = total_time % 60
     print(f"Best val_acc={best_val_acc:.4f}")
     print(f"Test loss={test_loss:.4f} | Test acc={test_acc:.4f}")
     print(f"Saved best checkpoint to: {best_path.resolve()}")
+    print(f"Total training time: {hours} {minutes} {seconds:.1f}")
 
 
 if __name__ == "__main__":
@@ -927,6 +957,7 @@ if __name__ == "__main__":
     parser.add_argument("--swin_embed_dim", type=int, default=96)
     parser.add_argument("--swin_depths", type=int, nargs="+", default=[2, 2, 6])
     parser.add_argument("--swin_num_heads", type=int, nargs="+", default=[3, 6, 12])
+    parser.add_argument("--disable_shift", action='store_true')
     args = parser.parse_args()
 
     cfg = TrainConfig(**vars(args))
