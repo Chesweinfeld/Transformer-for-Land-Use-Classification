@@ -15,10 +15,125 @@ try:
 except RuntimeError:
     pass
 
-
+import matplotlib.pyplot as plt
+import numpy as np
+from torchmetrics import ConfusionMatrix
+import seaborn as sns
 torch.set_float32_matmul_precision("high")
 
 
+# Analysis Helper Functions
+def plot_curves(data):
+    epochs = range(1, len(data["train_acc"]) + 1)
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, data["train_acc"], label="Train Accuracy")
+    plt.plot(epochs, data["val_acc"], label="Validation Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("accuracy.png")
+    plt.close()
+
+    # Loss
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, data["train_loss"], label="Train Loss")
+    plt.plot(epochs, data["val_loss"], label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("loss.png")
+    plt.close()
+
+
+@torch.no_grad()
+def generate_confusion_matrix(model,loader,classes,device):
+    model.eval()
+
+    num_classes = len(classes)
+
+    conmatrix = ConfusionMatrix(task="multiclass",num_classes=num_classes).to(device)
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits = model(x)
+        preds = logits.argmax(dim=1)
+
+        conmatrix(preds, y)
+
+    cm = conmatrix.compute().float()
+
+    # normalize rows
+    cm = cm / cm.sum(dim=1, keepdim=True)
+
+    plt.figure(figsize=(10, 8))
+
+    sns.heatmap(
+        cm.cpu(),
+        annot=True,
+        fmt=".2f",
+        cmap="viridis",
+        xticklabels=classes,
+        yticklabels=classes,
+        cbar=True
+    )
+
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
+
+    plt.xlabel("Predicted class")
+    plt.ylabel("True class")
+    plt.title("Normalized Confusion Matrix")
+
+    plt.tight_layout()
+
+    plt.savefig("confusion_matrix.png", dpi=200)
+
+    plt.close()
+
+import math
+from collections import defaultdict
+
+@torch.no_grad()
+def stage_attention_entropy(model, loader, device):
+
+    model.eval()
+
+    stage_scores = defaultdict(list)
+
+    for x, _ in loader:
+
+        x = x.to(device)
+
+        _ = model(x)
+
+        for name, m in model.named_modules():
+
+            if hasattr(m, "last_attn"):
+
+                a = m.last_attn.float().clamp_min(1e-9)
+
+                ent = -(a * a.log()).sum(dim=-1)
+
+                ent = ent / math.log(a.size(-1))
+
+                score = ent.mean().item()
+
+                # extract stage number from name
+                # e.g. layers.1.blocks.0.attn
+                if "layers." in name:
+                    stage = int(name.split(".")[1])
+                    stage_scores[stage].append(score)
+
+    means = {}
+
+    for stage in stage_scores:
+        means[stage] = sum(stage_scores[stage]) / len(stage_scores[stage])
+
+    return means
 # -----------------------------
 # Utilities
 # -----------------------------
@@ -204,6 +319,7 @@ class MultiHeadSelfAttentionScratch(nn.Module):
 
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
         attn_weights = softmax_scratch(attn_scores, dim=-1)
+        self.last_attn = attn_weights.detach().cpu()
         attn_weights = dropout_scratch(attn_weights, p=self.dropout, training=self.training)
 
         attn_out = attn_weights @ v
@@ -351,9 +467,9 @@ def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
         raise ValueError(
             f"feature map size ({height}, {width}) must be divisible by window_size={window_size}"
         )
-    h_windows = height // window_size
+    h_windows = height // window_size #
     w_windows = width // window_size
-    x = x.view(bsz, h_windows, window_size, w_windows, window_size, chans)
+    x = x.view(bsz, h_windows, window_size, w_windows, window_size, chans) #reshape into window grid
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
     return x.view(bsz * h_windows * w_windows, window_size, window_size, chans)
 
@@ -415,6 +531,7 @@ class WindowAttention(nn.Module):
             attn_scores = attn_scores.view(bsz, self.num_heads, seq_len, seq_len)
 
         attn_weights = softmax_scratch(attn_scores, dim=-1)
+        self.last_attn = attn_weights.detach().cpu()
         attn_weights = dropout_scratch(attn_weights, p=self.dropout, training=self.training)
 
         attn_out = attn_weights @ v
@@ -644,16 +761,17 @@ class SwinTransformer(nn.Module):
         patch_size: int = 4,
         in_chans: int = 3,
         num_classes: int = 10,
-        embed_dim: int = 96,
+        embed_dim: int = 48,
         depths: Tuple[int, ...] = (2, 2, 6),
         num_heads: Tuple[int, ...] = (3, 6, 12),
-        window_size: int = 4,
+        window_size: Tuple[int, ...]  = (4, 4, 4),
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         disable_shift: bool = False
     ):
         super().__init__()
         assert len(depths) == len(num_heads), "depths and num_heads must have the same length"
+        assert len(depths) == len(window_size), "depths and num_heads must have the same length"
         self.num_stages = len(depths)
         self.embed_dim = embed_dim
         self.num_features = int(embed_dim * 2 ** (self.num_stages - 1))
@@ -676,7 +794,7 @@ class SwinTransformer(nn.Module):
                 input_resolution=cur_resolution,
                 depth=depths[i_stage],
                 num_heads=num_heads[i_stage],
-                window_size=window_size,
+                window_size=window_size[i_stage],
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
                 downsample=not is_last,
@@ -704,7 +822,7 @@ class TrainConfig:
     data_dir: str
     img_size: int = 64
     batch_size: int = 256
-    epochs: int = 30
+    epochs: int = 10
     lr: float = 3e-4
     weight_decay: float = 1e-4
     val_split: float = 0.1
@@ -720,7 +838,7 @@ class TrainConfig:
     in_chans: int = 3
     pos_type: str = 'learned'
     model: str = 'vit'
-    window_size: int = 4
+    window_size: Tuple[int, ...] = (4, 4, 4)
     swin_embed_dim: int = 96
     swin_depths: Tuple[int, ...] = (2, 2, 6)
     swin_num_heads: Tuple[int, ...] = (3, 6, 12)
@@ -892,6 +1010,12 @@ def main(cfg: TrainConfig) -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
 
     best_val_acc = -math.inf
+    data = {
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": []
+    }
     best_path = Path(f"best_eurosat_{cfg.model}_scratch_mps_fast.pt")
     num_params = sum(p.numel() for p in model.parameters())
 
@@ -901,7 +1025,10 @@ def main(cfg: TrainConfig) -> None:
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
         scheduler.step()
-
+        data["train_loss"].append(train_loss)
+        data["train_acc"].append(train_acc)
+        data["val_loss"].append(val_loss)
+        data["val_acc"].append(val_acc)
         print(
             f"Epoch {epoch:02d}/{cfg.epochs} | "
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
@@ -923,9 +1050,22 @@ def main(cfg: TrainConfig) -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
     total_time = time.time() - start
+    #generate_confusion_matrix(model,test_loader,classes,device)  
     hours = int(total_time // 3600)
     minutes = int((total_time % 3600) // 60)
     seconds = total_time % 60
+
+    #plot_curves(data)
+    # stage_means = stage_attention_entropy(model, test_loader, device)
+
+    # plt.bar(stage_means.keys(), stage_means.values())
+    # plt.xlabel("Swin Stage")
+    # plt.ylabel("Normalized Attention Entropy")
+    # plt.title("Attention Uniformity Across Stages")
+    # plt.savefig("stage_entropy.png", dpi=200)
+    # plt.close()
+
+
     print(f"Best val_acc={best_val_acc:.4f}")
     print(f"Test loss={test_loss:.4f} | Test acc={test_acc:.4f}")
     print(f"Saved best checkpoint to: {best_path.resolve()}")
@@ -953,12 +1093,12 @@ if __name__ == "__main__":
     parser.add_argument("--in_chans", type=int, default=3)
     parser.add_argument("--pos_type", type=str, default='learned')
     parser.add_argument("--model", type=str, default='vit', choices=['vit', 'swin'])
-    parser.add_argument("--window_size", type=int, default=4)
+    parser.add_argument("--window_size",type=int,nargs="+",default=[4,4,4])
     parser.add_argument("--swin_embed_dim", type=int, default=96)
     parser.add_argument("--swin_depths", type=int, nargs="+", default=[2, 2, 6])
     parser.add_argument("--swin_num_heads", type=int, nargs="+", default=[3, 6, 12])
     parser.add_argument("--disable_shift", action='store_true')
     args = parser.parse_args()
-
+    args.window_size = tuple(args.window_size)
     cfg = TrainConfig(**vars(args))
     main(cfg)
